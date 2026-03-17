@@ -1,0 +1,16 @@
+# WhisperX Subtitle Generator - Requirements
+# Install via: install.bat (Windows) or install.sh (Linux)
+# DO NOT pip install this directly - use the install scripts
+# which handle torch+CUDA separately first
+
+# Core
+whisperx
+transformers==4.48.0
+huggingface-hub==0.28.1
+
+# Translation
+deep-translator
+
+# Utilities
+sentencepiece
+sacremoses
