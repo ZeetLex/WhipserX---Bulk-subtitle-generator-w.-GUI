@@ -16,8 +16,9 @@ env/
 # HuggingFace model cache (large, downloaded automatically)
 .cache/
 
-# OS
-.DS_Store
+# App data
+library.json
+ct2_models/
 Thumbs.db
 desktop.ini
 
