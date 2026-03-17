@@ -1,12 +1,13 @@
-# WhisperX Subtitle Generator - Requirements
-# Use install.bat on Windows — it handles PyTorch+CUDA separately
+# WhisperX Subtitle Generator - Python dependencies
+# Do NOT run pip install -r requirements.txt directly.
+# Use install.bat instead — it handles PyTorch + CUDA separately first.
 
-# Core
+# Core transcription
 whisperx
 transformers==4.48.0
 huggingface-hub==0.28.1
 
-# Translation - local offline (default)
+# Translation - offline (default)
 argostranslate
 
 # Translation - online fallback

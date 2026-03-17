@@ -13,6 +13,13 @@ import sys
 import queue
 from pathlib import Path
 
+# Suppress Windows "DLL load failed" popup dialogs (e.g. from torchcodec)
+try:
+    import ctypes
+    ctypes.windll.kernel32.SetErrorMode(0x8003)  # SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX
+except Exception:
+    pass
+
 # ─── Color palette ───────────────────────────────────────────────────────────
 BG          = "#0f0f0f"
 BG_PANEL    = "#181818"
