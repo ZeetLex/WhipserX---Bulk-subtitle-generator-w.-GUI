@@ -105,15 +105,18 @@ class SubtitleApp(tk.Tk):
 
         # Variables
         self.folder_var      = tk.StringVar(value="")
-        self.queue_folders   = []          # ordered list of folder paths in queue
+        self.queue_folders   = []
         self.model_var       = tk.StringVar(value="medium")
         self.compute_var     = tk.StringVar(value="float16")
         self.lang_var        = tk.StringVar(value="auto-detect")
         self.target_var      = tk.StringVar(value="English (en)")
+        self.trans_engine_var = tk.StringVar(value="Argos (local, offline)")
         self.skip_var        = tk.BooleanVar(value=True)
         self.skip_no_var     = tk.BooleanVar(value=True)
         self.keep_orig_var   = tk.BooleanVar(value=True)
         self.dry_run_var     = tk.BooleanVar(value=False)
+        self.delete_en_var   = tk.BooleanVar(value=False)
+        self.delete_no_var   = tk.BooleanVar(value=False)
         self.batch_size_var  = tk.StringVar(value="4")
 
         self.video_files     = []
@@ -237,6 +240,12 @@ class SubtitleApp(tk.Tk):
         styled_entry(grid, self.batch_size_var, width=6).grid(row=2, column=1,
                                                                sticky="w", padx=(0, 24))
 
+        lbl(grid, "Translation engine", 2, 2)
+        styled_combo(grid, [
+            "Argos (local, offline)",
+            "Google Translate (online)",
+        ], self.trans_engine_var, width=26).grid(row=2, column=3, sticky="w")
+
         # ── Options card ──────────────────────────────────────────────────────
         opts_card = tk.Frame(outer, bg=BG_PANEL, padx=16, pady=14)
         opts_card.pack(fill="x", pady=(0, 8))
@@ -258,6 +267,12 @@ class SubtitleApp(tk.Tk):
         chk(opts_card, "Skip files that already have a .no.srt", self.skip_no_var).pack(anchor="w", pady=2)
         chk(opts_card, "Also save original-language .srt", self.keep_orig_var).pack(anchor="w", pady=2)
         chk(opts_card, "Dry run (list files only, no processing)", self.dry_run_var).pack(anchor="w", pady=2)
+
+        tk.Frame(opts_card, bg=BORDER, height=1).pack(fill="x", pady=(8, 4))
+        tk.Label(opts_card, text="DELETE EXISTING SUBTITLES BEFORE PROCESSING",
+                 font=("Consolas", 8, "bold"), fg=TEXT_MUTED, bg=BG_PANEL).pack(anchor="w")
+        chk(opts_card, "Delete existing .en.srt files (replaces Bazarr subs)", self.delete_en_var).pack(anchor="w", pady=2)
+        chk(opts_card, "Delete existing .no.srt files", self.delete_no_var).pack(anchor="w", pady=2)
 
         # ── Log card ──────────────────────────────────────────────────────────
         log_card = tk.Frame(outer, bg=BG_PANEL, padx=16, pady=14)
@@ -481,8 +496,11 @@ class SubtitleApp(tk.Tk):
         compute_raw  = self.compute_var.get().split()[0]
         lang_raw     = self.lang_var.get()
         target_raw   = self.target_var.get()
+        trans_engine = self.trans_engine_var.get()
         keep_orig    = self.keep_orig_var.get()
         dry_run      = self.dry_run_var.get()
+        delete_en    = self.delete_en_var.get()
+        delete_no    = self.delete_no_var.get()
         batch_size   = int(self.batch_size_var.get() or 16)
 
         src_lang = None if lang_raw == "auto-detect" else lang_raw.split("(")[-1].rstrip(")")
@@ -492,6 +510,7 @@ class SubtitleApp(tk.Tk):
         q(f"─── Starting batch ───────────────────────────", "dim")
         q(f"  Model    : {model_name}", "info")
         q(f"  Device   : {device} ({compute_raw})", "info")
+        q(f"  Engine   : {trans_engine}", "info")
         q(f"  Files    : {len(self.video_files)}", "info")
         if dry_run:
             q("  Mode     : DRY RUN", "warn")
@@ -519,25 +538,103 @@ class SubtitleApp(tk.Tk):
             return
 
 
-        # Google Translate via deep-translator (no API key, no local model)
-        GOOGLE_LANG = {
-            "no": "no", "nb": "no", "sv": "sv", "da": "da",
+        # ── Translation engines ───────────────────────────────────────────────
+        LANG_MAP = {
+            "no": "nb", "nb": "nb", "sv": "sv", "da": "da",
             "de": "de", "fr": "fr", "es": "es", "fi": "fi",
             "nl": "nl", "it": "it", "pl": "pl", "en": "en",
+            "ja": "ja", "ko": "ko", "zh": "zh",
         }
+        GOOGLE_LANG = {**LANG_MAP, "nb": "no"}
 
-        def translate_texts(texts, src, tgt):
+        # Cache loaded translation models
+        ct2_model_cache = {}
+
+        # Enable Argos GPU usage, disable Stanza SBD to avoid interference
+        import os as _os
+        _os.environ["ARGOS_DEVICE_TYPE"] = "cuda" if device == "cuda" else "cpu"
+        _os.environ["ARGOS_STANZA_AVAILABLE"] = "False"
+
+        def translate_ct2(texts, src, tgt):
+            """Translate using Argos Translate with GPU support."""
+            try:
+                import argostranslate.package as ap
+                import argostranslate.translate as at
+
+                al_src = LANG_MAP.get(src, src)
+                al_tgt = LANG_MAP.get(tgt, tgt)
+                key = (al_src, al_tgt)
+
+                if key not in ct2_model_cache:
+                    tgt_codes = ["nb", "no"] if al_tgt in ("nb", "no") else [al_tgt]
+
+                    installed = at.get_installed_languages()
+                    src_lang  = next((l for l in installed if l.code == al_src), None)
+                    tgt_lang  = None
+                    for tc in tgt_codes:
+                        tgt_lang = next((l for l in installed if l.code == tc), None)
+                        if tgt_lang:
+                            al_tgt = tc
+                            break
+
+                    if not src_lang or not tgt_lang:
+                        q(f"  Downloading Argos pack {al_src}→{tgt_codes[0]}…", "info")
+                        try:
+                            ap.update_package_index()
+                            available = ap.get_available_packages()
+                            pkg = next((p for p in available
+                                       if p.from_code == al_src and p.to_code in tgt_codes), None)
+                            if not pkg:
+                                q(f"  ⚠  No Argos pack for {al_src}→{tgt_codes}, falling back to Google", "warn")
+                                return translate_google(texts, src, tgt)
+                            ap.install_from_path(pkg.download())
+                            q(f"  ✓  Pack installed", "ok")
+                            installed = at.get_installed_languages()
+                            src_lang  = next((l for l in installed if l.code == al_src), None)
+                            for tc in tgt_codes:
+                                tgt_lang = next((l for l in installed if l.code == tc), None)
+                                if tgt_lang:
+                                    al_tgt = tc
+                                    break
+                        except Exception as e:
+                            q(f"  ⚠  Pack install failed: {e}, falling back to Google", "warn")
+                            return translate_google(texts, src, tgt)
+
+                    if not src_lang or not tgt_lang:
+                        q(f"  ⚠  Languages not available, falling back to Google", "warn")
+                        return translate_google(texts, src, tgt)
+
+                    translation = src_lang.get_translation(tgt_lang)
+                    if not translation:
+                        q(f"  ⚠  No translation object for {al_src}→{al_tgt}, falling back to Google", "warn")
+                        return translate_google(texts, src, tgt)
+
+                    ct2_model_cache[key] = translation
+                    q(f"  ✓  Argos ready ({al_src}→{al_tgt}, GPU: {device == 'cuda'})", "ok")
+
+                translation = ct2_model_cache[key]
+                results = list(texts)
+                for i, text in enumerate(texts):
+                    if text.strip():
+                        results[i] = translation.translate(text)
+                return results
+
+            except ImportError:
+                q("  ⚠  argostranslate not installed. Run: pip install argostranslate", "warn")
+                q("  ⚠  Falling back to Google Translate", "warn")
+                return translate_google(texts, src, tgt)
+            except Exception as e:
+                q(f"  ⚠  Argos error: {e}, falling back to Google", "warn")
+                return translate_google(texts, src, tgt)
+
+        def translate_google(texts, src, tgt):
+            import time
             try:
                 from deep_translator import GoogleTranslator
                 gl_src = GOOGLE_LANG.get(src, src)
                 gl_tgt = GOOGLE_LANG.get(tgt, tgt)
-                translator = GoogleTranslator(source=gl_src, target=gl_tgt)
-
-                # Join lines with a unique separator Google won't mangle,
-                # send in one request, then split back out
                 SEPARATOR = " ||| "
-                MAX_CHARS = 4500  # stay under Google's 5000 char limit
-
+                MAX_CHARS = 4500
                 results = [""] * len(texts)
                 batch_indices = []
                 batch_chars = 0
@@ -547,20 +644,30 @@ class SubtitleApp(tk.Tk):
                     if not batch_lines:
                         return
                     joined = SEPARATOR.join(batch_lines)
-                    try:
-                        translated_joined = translator.translate(joined) or joined
-                        parts = translated_joined.split(SEPARATOR)
-                        # If split count matches, assign results
-                        if len(parts) == len(batch_indices):
-                            for idx, part in zip(batch_indices, parts):
-                                results[idx] = part.strip()
-                        else:
-                            # Fallback: assign what we have, leave rest as original
-                            for i, idx in enumerate(batch_indices):
-                                results[idx] = parts[i].strip() if i < len(parts) else texts[idx]
-                    except Exception:
-                        for idx in batch_indices:
-                            results[idx] = texts[idx]
+                    for attempt in range(3):
+                        try:
+                            translator = GoogleTranslator(source=gl_src, target=gl_tgt)
+                            translated_joined = translator.translate(joined)
+                            if not translated_joined:
+                                raise ValueError("Empty response")
+                            parts = translated_joined.split(SEPARATOR)
+                            if len(parts) == len(batch_indices):
+                                for idx, part in zip(batch_indices, parts):
+                                    results[idx] = part.strip()
+                            else:
+                                for i, idx in enumerate(batch_indices):
+                                    results[idx] = parts[i].strip() if i < len(parts) else texts[idx]
+                            time.sleep(0.3)
+                            break
+                        except Exception:
+                            if attempt < 2:
+                                wait = (attempt + 1) * 3
+                                q(f"  ⚠  Google attempt {attempt+1} failed, retrying in {wait}s…", "warn")
+                                time.sleep(wait)
+                            else:
+                                q(f"  ⚠  Google translation failed, keeping original", "warn")
+                                for idx in batch_indices:
+                                    results[idx] = texts[idx]
                     batch_indices.clear()
                     batch_lines.clear()
 
@@ -575,13 +682,23 @@ class SubtitleApp(tk.Tk):
                     batch_indices.append(i)
                     batch_lines.append(text)
                     batch_chars += line_len
-
                 flush_batch()
+
+                translated_count = sum(1 for i, r in enumerate(results)
+                                       if r.strip() and r.strip() != texts[i].strip())
+                if translated_count == 0 and any(t.strip() for t in texts):
+                    q(f"  ⚠  Translation appears to have failed (all text unchanged)", "warn")
                 return results
 
             except ImportError:
                 q("  ⚠  deep-translator not installed. Run: pip install deep-translator", "warn")
                 return texts
+
+        def translate_texts(texts, src, tgt):
+            if "Argos" in trans_engine:
+                return translate_ct2(texts, src, tgt)
+            else:
+                return translate_google(texts, src, tgt)
 
         def fix_caps(text):
             # Fix ALL CAPS output from Whisper
@@ -596,6 +713,21 @@ class SubtitleApp(tk.Tk):
             rel = video.name
             q(f"\n[{idx+1}/{total}]  {rel}", "info")
             self.status_label.configure(text=f"Processing {idx+1}/{total}: {rel}")
+
+            # Delete existing subtitle files if requested
+            if delete_en or delete_no:
+                import glob
+                base = str(video.with_suffix(""))
+                for existing in glob.glob(base + "*.srt"):
+                    ep = Path(existing)
+                    name = ep.name.lower()
+                    if delete_en and (".en." in name or name.endswith(".en.srt")):
+                        ep.unlink()
+                        q(f"  deleted: {ep.name}", "dim")
+                    elif delete_no and (".no." in name or ".nb." in name or
+                                        name.endswith(".no.srt") or name.endswith(".nb.srt")):
+                        ep.unlink()
+                        q(f"  deleted: {ep.name}", "dim")
 
             try:
                 import whisperx as wx
@@ -642,11 +774,14 @@ class SubtitleApp(tk.Tk):
 
                 # Translate if target language differs from detected language
                 if tgt_lang and tgt_lang != detected:
-                    q(f"  translating {detected}→{tgt_lang} via Google Translate…", "dim")
+                    q(f"  translating {detected}→{tgt_lang} ({trans_engine.split('(')[0].strip()})…", "dim")
                     texts = [s["text"].strip() for s in segs]
                     translated = translate_texts(texts, detected, tgt_lang)
                     for s, t in zip(segs, translated):
                         s["text"] = t
+                        # Clear word-level data so _to_srt uses translated text
+                        # (word entries still contain original English)
+                        s.pop("words", None)
                     q(f"  translated {detected}→{tgt_lang}", "dim")
 
                 # Plex naming: ShowName.S01E01.LANG.srt next to video file
@@ -705,6 +840,7 @@ def _to_srt(segments):
         text = seg.get("text", "").strip()
         start = float(seg.get("start", 0))
         end   = float(seg.get("end", 0))
+        duration = end - start
         words = seg.get("words", [])
 
         if len(text) <= max_chars and not words:

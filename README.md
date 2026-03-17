@@ -1,92 +1,96 @@
 # WhisperX Subtitle Generator
 
-Batch subtitle generator for media libraries. Uses your NVIDIA GPU to transcribe audio from video files and translate subtitles to your language of choice. Outputs Plex-compatible `.srt` files.
+A GUI tool for batch-generating subtitles for large media libraries using your NVIDIA GPU. Transcribes audio with WhisperX and translates using Argos Translate (offline) or Google Translate.
 
-## Features
+Built mainly for Plex libraries where existing subtitles from tools like Bazarr don't match properly.
 
-- GPU-accelerated transcription via WhisperX
-- Automatic language detection
-- Google Translate integration (no API key needed)
-- Batch processing of entire TV show seasons/libraries
-- Plex-compatible subtitle naming (`Show.S01E01.no.srt`)
-- Skips files that already have subtitles
-- Dark GUI with progress logging
+---
 
 ## Requirements
 
 - Windows 10/11
 - Python 3.11 — https://python.org/downloads/release/python-3110/
-  - ⚠️ During install, check **"Add Python to PATH"**
-- NVIDIA GPU with CUDA support (GTX 1000 series or newer)
-- Internet connection (for downloading models and translation)
+  - Check **"Add Python to PATH"** during install
+- NVIDIA GPU (GTX 1000 series or newer)
+- Internet connection for first-time model downloads
+
+---
 
 ## Installation
 
 1. Clone or download this repo
 2. Double-click **`install.bat`**
-3. Wait for it to finish (PyTorch alone is ~2.5GB so this takes a while)
-4. Done — run with **`run.bat`**
+3. Wait for it to finish — PyTorch is large (~2.5GB) so this takes a while
+4. Run with **`run.bat`**
+
+---
 
 ## Usage
 
 1. Run `run.bat`
-2. Click **Browse** and select your target folder (e.g. `Z:\media\tv\Show Name\Season 1`)
-3. Click **Scan** to see how many files will be processed
-4. Choose your settings:
-   - **Whisper model**: `small` for speed, `medium` for quality (recommended), `large-v3` for best
-   - **Compute type**: `float16` if you have 8GB+ VRAM, `int8_float16` for less
-   - **Source language**: set if you know it, otherwise leave on auto-detect
-   - **Translate to**: your target language
-   - **Batch size**: 8 is a good default for most GPUs
-5. Click **▶ Start Processing**
+2. Add folders to the queue using **Browse** + **Add to Queue**
+3. Use ▲/▼ to set processing priority
+4. Click **Scan Queue** to count files
+5. Set your options and click **▶ Start Processing**
 
-Subtitle files are saved next to each video file automatically.
+Subtitles are saved next to each video file in Plex format: `Show.S01E01.no.srt`
 
-## Model Size Guide
+---
 
-| Model    | VRAM   | Speed (RTX 3090) | Quality        |
-|----------|--------|------------------|----------------|
-| tiny     | ~1 GB  | ~32× realtime    | Poor           |
-| base     | ~1.5GB | ~16× realtime    | Okay           |
-| small    | ~2.5GB | ~8× realtime     | Good           |
-| medium   | ~5 GB  | ~4× realtime     | Very good ★    |
-| large-v2 | ~10GB  | ~2× realtime     | Excellent      |
-| large-v3 | ~10GB  | ~2× realtime     | Best           |
+## Settings
+
+**Whisper model** — bigger = more accurate but slower
+
+| Model | VRAM | Speed (RTX 3090) | Quality |
+|-------|------|-----------------|---------|
+| tiny | ~1GB | ~32x realtime | poor |
+| base | ~1.5GB | ~16x realtime | okay |
+| small | ~2.5GB | ~8x realtime | good |
+| medium | ~5GB | ~4x realtime | very good |
+| large-v3 | ~10GB | ~2x realtime | best |
+
+**Compute type** — `float16` for 8GB+ VRAM, `int8_float16` if you have less
+
+**Translation engine**
+- `Argos (local, offline)` — runs fully offline, no rate limits, good for large batches. Downloads a ~100MB language pack on first use.
+- `Google Translate (online)` — better quality but requires internet and may rate-limit on large batches
+
+**Batch size** — how many audio chunks to process at once. Higher = faster but more VRAM. Start at 4-8 and go up if stable.
+
+---
+
+## Options
+
+- **Skip files that already have a .en.srt / .no.srt** — avoid reprocessing what's already done
+- **Also save original-language .srt** — saves the raw transcription before translation
+- **Delete existing .en.srt / .no.srt** — removes old subtitle files before generating new ones, useful for replacing mismatched Bazarr subs
+- **Dry run** — lists files without processing them, useful for checking what will be affected
+
+---
 
 ## Tips
 
-- Close Chrome, games, and other GPU-heavy apps before running
-- The first run will download AI models (~1-5GB depending on model size) — subsequent runs are instant
-- Use **Dry run** to preview which files will be processed without actually processing them
-- Enable **Skip files that already have a .no.srt** to safely re-run without duplicating work
-- If the GPU crashes mid-batch, close the GUI fully, restart it, and it will skip already-completed files
+- Close Chrome and other GPU-heavy apps before running
+- The first run downloads AI models — subsequent runs are much faster
+- If the GPU crashes mid-batch, close and reopen the GUI (resets CUDA state), then run again — already-completed files will be skipped
+- For a large backlog, `small` model is a reasonable tradeoff between speed and quality
 
-## Output Format
-
-Subtitles are saved as `VideoFilename.LANG.srt` next to the video file:
-```
-Show - S01E01 - Episode Title.mkv
-Show - S01E01 - Episode Title.en.srt   (original language, if "Also save original" is checked)
-Show - S01E01 - Episode Title.no.srt   (translated)
-```
-
-Plex picks these up automatically — no configuration needed.
+---
 
 ## Troubleshooting
 
-**"python is not recognized"** — Python is not in PATH. Reinstall Python and check "Add to PATH".
+**"python is not recognized"** — Python not in PATH. Reinstall and check "Add to PATH".
 
-**"No CUDA GPU found"** — PyTorch was installed without CUDA support. Run `install.bat` again, or manually run:
-```
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
-```
+**"No CUDA GPU found"** — PyTorch was installed without CUDA. Run `install.bat` again.
 
-**CUDA crashes mid-batch** — Close all GPU-heavy background apps (Chrome with hardware acceleration, games, OBS). Reduce batch size to 4.
+**CUDA crashes** — Close background GPU apps, lower batch size.
 
-**Translation not working** — Check your internet connection. Google Translate is used via HTTP requests.
+**Translation not working (Google)** — Check internet connection, or switch to Argos.
 
-**Subtitles out of sync** — This can happen if alignment fails. The tool falls back to proportional timing which is close but not perfect. Try re-running that file with a larger model.
+**Subtitles out of sync** — Alignment occasionally fails and falls back to proportional timing. Re-running the specific file usually fixes it.
+
+---
 
 ## License
 
-MIT — do whatever you want with it.
+MIT
