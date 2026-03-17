@@ -92,8 +92,9 @@ def is_our_srt(srt_path: Path) -> bool:
     try:
         for enc in ("utf-8-sig", "utf-8", "latin-1"):
             try:
-                first = srt_path.read_text(encoding=enc, errors="ignore")[:200]
-                if OUR_TAG in first:
+                # Check both start and end — tag may be at either location
+                content = srt_path.read_text(encoding=enc, errors="ignore")
+                if OUR_TAG in content:
                     return True
                 break
             except Exception:
@@ -103,26 +104,46 @@ def is_our_srt(srt_path: Path) -> bool:
         return False
 
 
+def has_embedded_subs(video: Path) -> bool:
+    """Check if a video file has embedded subtitle streams using ffprobe."""
+    import subprocess, json
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_streams", "-select_streams", "s", str(video)],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode != 0:
+            return False
+        data = json.loads(result.stdout)
+        return len(data.get("streams", [])) > 0
+    except Exception:
+        return False
+
+
 def scan_video_status(video: Path, lang: str,
                       cached: dict = None) -> tuple:
     """
     Returns (status, our_srt, srt_path, fingerprint).
 
-    Checks all known SRT variants explicitly — does not rely solely on
-    iterdir so it works reliably on NAS/network drives.
+    Status values:
+      NEW          — never seen before, no subtitles of any kind
+      UNPROCESSED  — seen before, still no external subtitles
+      DONE         — our SRT exists and file unchanged
+      CHANGED      — our SRT exists but video file was modified
+      EXTERNAL     — external SRT exists but not ours
+      EMBEDDED     — no external SRT but video has embedded subtitle streams
     """
     fp = file_fingerprint(video)
     stem = video.stem
-    base = str(video.with_suffix(""))  # strip video extension
+    base = str(video.with_suffix(""))
 
-    # Explicitly check all common language variants — catches .en.srt, .nb.srt etc.
     COMMON_LANGS = ["en", "no", "nb", "sv", "da", "de", "fr", "es", "fi", "nl", "it"]
     explicit = [Path(f"{base}.{l}.srt") for l in COMMON_LANGS]
     explicit += [Path(f"{base}.srt")]
     if lang not in COMMON_LANGS:
         explicit.insert(0, Path(f"{base}.{lang}.srt"))
 
-    # Also scan directory for any other variants we may have missed
     try:
         dir_srts = [f for f in video.parent.iterdir()
                     if f.suffix.lower() == ".srt"
@@ -130,7 +151,6 @@ def scan_video_status(video: Path, lang: str,
     except Exception:
         dir_srts = []
 
-    # Deduplicate, explicit first
     seen = set()
     candidates = []
     for s in explicit + dir_srts:
@@ -148,7 +168,11 @@ def scan_video_status(video: Path, lang: str,
             else:
                 return "EXTERNAL", False, str(srt), fp
 
-    # No subtitle found — use cache only for NEW vs UNPROCESSED distinction
+    # No external SRT — check for embedded subtitles
+    if has_embedded_subs(video):
+        return "EMBEDDED", False, "", fp
+
+    # No subtitles at all
     if cached and cached.get("scanned_at"):
         return "UNPROCESSED", False, "", fp
     return "NEW", False, "", fp
@@ -240,6 +264,7 @@ class SubtitleApp(tk.Tk):
         self.delete_no_var    = tk.BooleanVar(value=False)
         self.batch_size_var   = tk.StringVar(value="4")
         self.scan_lang_var    = tk.StringVar(value="no")
+        self.subtitle_offset_var = tk.StringVar(value="0.25")  # seconds to shift sub start forward
 
         # Library state
         self.script_dir   = Path(os.path.dirname(os.path.abspath(__file__)))
@@ -248,9 +273,10 @@ class SubtitleApp(tk.Tk):
         self.lib_entries  = []
         self.lib_mode     = tk.StringVar(value="library")  # kept for compat
 
-        self.video_files  = []
-        self.job_list     = []   # list of {"path": Path, "status": "pending"|"running"|"done"|"error", "iid": str}
-        self.is_running   = False
+        self.video_files    = []
+        self.job_list       = []   # list of {"path": Path, "status": "pending"|"running"|"done"|"error"|"removed", "iid": str}
+        self.is_running     = False
+        self.stop_requested = False
 
         self._build_ui()
         self._poll_log()
@@ -285,6 +311,11 @@ class SubtitleApp(tk.Tk):
         self.run_btn = FlatButton(bar, "▶  Start Processing",
                                   command=self._start, accent=True)
         self.run_btn.pack(side="right")
+
+        self.stop_btn = FlatButton(bar, "⏹  Stop After Current",
+                                   command=self._request_stop)
+        self.stop_btn.pack(side="right", padx=(0, 8))
+        self.stop_btn.configure(state="disabled", fg=TEXT_MUTED)
 
         FlatButton(bar, "Clear Log", command=self._clear_log).pack(side="right", padx=(0, 8))
         FlatButton(bar, "Quit", command=self._quit).pack(side="right", padx=(0, 8))
@@ -401,11 +432,17 @@ class SubtitleApp(tk.Tk):
         lbl(grid, "Batch size", 4, 0)
         styled_entry(grid, self.batch_size_var, width=6).grid(row=4, column=1, sticky="w")
 
-        lbl(grid, "Translation engine", 5, 0)
+        lbl(grid, "Sub start offset (s)", 5, 0)
+        tk.Label(grid, text="shift subtitle start forward  (0.0 = no shift, 0.25 = default)",
+                 font=("Consolas", 8), fg=TEXT_MUTED, bg=BG_PANEL).grid(
+                 row=6, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        styled_entry(grid, self.subtitle_offset_var, width=6).grid(row=5, column=1, sticky="w")
+
+        lbl(grid, "Translation engine", 7, 0)
         styled_combo(grid, [
             "Argos (local, offline)",
             "Google Translate (online)",
-        ], self.trans_engine_var, width=24).grid(row=5, column=1, sticky="ew")
+        ], self.trans_engine_var, width=24).grid(row=7, column=1, sticky="ew")
 
         # Right: Options
         opts_card = tk.Frame(config_row, bg=BG_PANEL, padx=16, pady=14)
@@ -484,11 +521,9 @@ class SubtitleApp(tk.Tk):
         LibraryWindow(self)
 
     def _queue_from_library(self, video_files: list):
-        """Called by LibraryWindow to send files to the processor."""
+        """Called by LibraryWindow to add files to the queue."""
         self._add_jobs(video_files)
-        self._log(f"✓  {len(video_files)} file(s) added to queue from Library Manager.", "ok")
-        if not self.is_running:
-            self._start()
+        self._log(f"✓  {len(video_files)} file(s) added to queue. Adjust settings and click Start Processing.", "ok")
 
     # ── Stub methods used by old library UI (kept for _lib_scan_worker) ───────
     def _lib_browse(self):
@@ -577,6 +612,7 @@ class SubtitleApp(tk.Tk):
                 elif all(s in ("NEW","UNPROCESSED") for s in statuses): agg = "UNPROCESSED"
                 elif "CHANGED" in status_set:                           agg = "CHANGED"
                 elif "NEW" in status_set or "UNPROCESSED" in status_set: agg = "PARTIAL"
+                elif "EMBEDDED" in status_set and not any(s in ("NEW","UNPROCESSED") for s in statuses): agg = "EMBEDDED"
                 elif "EXTERNAL" in status_set:                          agg = "EXTERNAL"
                 else:                                                   agg = "DONE"
                 entries.append({
@@ -682,12 +718,18 @@ class SubtitleApp(tk.Tk):
     def _job_remove(self):
         sel = self.job_tree.selection()
         for iid in sel:
-            # Don't remove currently running item
             job = next((j for j in self.job_list if j["iid"] == iid), None)
-            if job and job["status"] == "running":
+            if not job or job["status"] == "running":
                 continue
-            self.job_tree.delete(iid)
-            self.job_list = [j for j in self.job_list if j["iid"] != iid]
+            # Set removed on the dict — batch loop checks this each iteration
+            job["status"] = "removed"
+            try:
+                self.job_tree.delete(iid)
+            except Exception:
+                pass
+        # Remove from list — the batch loop's 'pending' snapshot still holds
+        # references to the dicts, so it will still see status=="removed"
+        self.job_list = [j for j in self.job_list if j["status"] != "removed"]
         self._update_job_label()
 
     def _job_clear_done(self):
@@ -740,18 +782,26 @@ class SubtitleApp(tk.Tk):
         self.after(100, self._poll_log)
 
     # ── Start processing ──────────────────────────────────────────────────────
+    def _request_stop(self):
+        self.stop_requested = True
+        self.after(0, lambda: self.stop_btn.configure(
+            text="⏹  Stopping…", state="disabled", fg=TEXT_MUTED))
+        self.after(0, lambda: self.status_label.configure(
+            text="Stopping after current file completes…"))
+
     def _start(self):
         if self.is_running:
             return
-        # If manual folders were added but not scanned yet, scan now
         if self.queue_folders and not any(j["status"] == "pending" for j in self.job_list):
             self._scan_queue()
         pending = [j for j in self.job_list if j["status"] == "pending"]
         if not pending:
             self._log("⚠  No pending files in queue. Add folders or use Library Manager.", "warn")
             return
-        self.is_running = True
+        self.is_running     = True
+        self.stop_requested = False
         self.run_btn.configure_text("⏳  Running…")
+        self.stop_btn.configure(text="⏹  Stop After Current", state="normal", fg=TEXT)
         self.progress_var.set(0)
         t = threading.Thread(target=self._run_batch, daemon=True)
         t.start()
@@ -779,11 +829,25 @@ class SubtitleApp(tk.Tk):
         delete_en    = self.delete_en_var.get()
         delete_no    = self.delete_no_var.get()
         batch_size   = int(self.batch_size_var.get() or 16)
+        try:
+            sub_offset = float(self.subtitle_offset_var.get() or 0.25)
+        except ValueError:
+            sub_offset = 0.25
 
         src_lang = None if lang_raw == "auto-detect" else lang_raw.split("(")[-1].rstrip(")")
         tgt_lang = None if "None" in target_raw else target_raw.split("(")[-1].rstrip(")")
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # Log VRAM and cap batch size based on available VRAM
+        if device == "cuda":
+            vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            # Safe batch size caps: 4 for <12GB, 8 for <20GB, 12 for 20GB+
+            max_safe = 4 if vram_gb < 12 else (8 if vram_gb < 20 else 12)
+            if batch_size > max_safe:
+                q(f"  ⚠  Batch size {batch_size} capped to {max_safe} for {vram_gb:.0f}GB VRAM", "warn")
+                batch_size = max_safe
+            q(f"  VRAM     : {vram_gb:.1f}GB  (max batch: {max_safe})", "info")
 
         # Load Whisper model
         q(f"Loading model '{model_name}' …", "info")
@@ -793,6 +857,12 @@ class SubtitleApp(tk.Tk):
                 model_name, device, compute_type=compute_raw,
                 language=src_lang
             )
+            # Re-enable TF32 — pyannote disables it globally which causes
+            # illegal memory access in ctranslate2 on some driver versions
+            if device == "cuda":
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                torch.backends.cudnn.benchmark  = False
             q(f"✓  Model loaded.", "ok")
         except Exception as e:
             q(f"✗  Failed to load model: {e}", "err")
@@ -988,6 +1058,13 @@ class SubtitleApp(tk.Tk):
             return
 
         for idx, job in enumerate(pending):
+            # Check if stopped or job was removed while running
+            if self.stop_requested:
+                q(f"\n⏹  Stopped by user after {done}/{total} file(s).", "warn")
+                break
+            if job["status"] == "removed":
+                continue
+
             video = job["path"]
             iid   = job["iid"]
             rel   = video.name
@@ -1018,91 +1095,197 @@ class SubtitleApp(tk.Tk):
                 import whisperx as wx
                 import torch as _t
                 import gc
+                import time as _time
 
-                # Clear GPU memory before each file
+                # ── Pre-file GPU cleanup ──────────────────────────────────────
+                _t.cuda.synchronize()
+                _t.cuda.empty_cache()
+                gc.collect()
+                _time.sleep(0.3)
+
+                # Pyannote disables TF32 globally — re-enable for ctranslate2
+                _t.backends.cuda.matmul.allow_tf32 = True
+                _t.backends.cudnn.allow_tf32 = True
+                _t.backends.cudnn.benchmark  = False
+                # Enable synchronous CUDA error reporting for better crash info
+                _os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
+                # ── Load and transcribe audio ─────────────────────────────────
+                audio = wx.load_audio(str(video))
+
+                # Validate audio — catch bad files before they hit the GPU
+                if audio is None or len(audio) == 0:
+                    raise ValueError("Audio is empty or could not be loaded")
+
+                # Try GPU first, fall back to CPU if CUDA error
+                try:
+                    result = whisper_model.transcribe(audio, batch_size=batch_size)
+                except Exception as transcribe_err:
+                    if "CUDA" in str(transcribe_err) or "illegal memory" in str(transcribe_err):
+                        q(f"  ⚠  CUDA error in transcription — retrying on CPU…", "warn")
+                        _t.cuda.empty_cache()
+                        gc.collect()
+                        _time.sleep(2)
+                        cpu_model = whisperx.load_model(
+                            model_name, "cpu", compute_type="int8",
+                            language=src_lang
+                        )
+                        result = cpu_model.transcribe(audio, batch_size=2)
+                        del cpu_model
+                        gc.collect()
+                    else:
+                        raise
+
+                segs     = result["segments"]
+                detected = result.get("language", src_lang or "?")
+                del result
+                q(f"  language detected: {detected}", "dim")
+
+                # Free audio from GPU/RAM before loading alignment model
                 _t.cuda.empty_cache()
                 gc.collect()
 
-                audio  = wx.load_audio(str(video))
-                result = whisper_model.transcribe(audio, batch_size=batch_size)
-                segs   = result["segments"]
-                detected = result.get("language", src_lang or "?")
-                q(f"  language detected: {detected}", "dim")
-
-                # Run alignment on GPU to get word-level timestamps
+                # ── Alignment ─────────────────────────────────────────────────
                 try:
                     align_model, align_meta = wx.load_align_model(
                         language_code=detected, device=device)
                     aligned = wx.align(segs, align_model, align_meta, audio, device,
                                        return_char_alignments=False)
                     segs = aligned["segments"]
-                    del align_model
+                    del align_model, align_meta, aligned
+                    _t.cuda.synchronize()
                     _t.cuda.empty_cache()
                     gc.collect()
                     q(f"  aligned", "dim")
-                except Exception as e:
+                except Exception as align_err:
                     q(f"  ⚠  alignment skipped, using proportional split", "warn")
                     try:
-                        _t.cuda.empty_cache()
-                        gc.collect()
+                        del align_model
                     except Exception:
                         pass
+                    try:
+                        del align_meta
+                    except Exception:
+                        pass
+                    _t.cuda.empty_cache()
+                    gc.collect()
 
-                # Fix ALL CAPS segments from Whisper
+                # Free audio now — no longer needed
+                del audio
+                gc.collect()
+
+                # ── Fix caps ──────────────────────────────────────────────────
                 for s in segs:
                     s["text"] = fix_caps(s["text"].strip())
 
                 if keep_orig:
-                    orig_path = video.with_suffix(f".{detected}.srt")
-                    orig_path.write_text(_to_srt(segs), encoding="utf-8-sig")
-                    q(f"  saved: {orig_path.name}", "dim")
+                    orig_path = Path(str(video.with_suffix("")) + f".{detected}.srt")
+                    srt_content = _to_srt(segs, sub_offset)
+                    for attempt in range(3):
+                        try:
+                            orig_path.write_text(srt_content, encoding="utf-8-sig")
+                            q(f"  saved: {orig_path.name}", "dim")
+                            break
+                        except PermissionError:
+                            if attempt < 2:
+                                q(f"  ⚠  file locked, retrying in 3s…", "warn")
+                                _time.sleep(3)
+                            else:
+                                q(f"  ⚠  could not save {orig_path.name} — file is locked by another process", "warn")
 
-                # Translate if target language differs from detected language
+                # ── Translation ───────────────────────────────────────────────
+                # Run Argos on CPU to avoid competing with Whisper for VRAM
                 if tgt_lang and tgt_lang != detected:
                     q(f"  translating {detected}→{tgt_lang} ({trans_engine.split('(')[0].strip()})…", "dim")
+                    # Move Argos to CPU during translation to free GPU headroom
+                    _os.environ["ARGOS_DEVICE_TYPE"] = "cpu"
                     texts = [s["text"].strip() for s in segs]
                     translated = translate_texts(texts, detected, tgt_lang)
+                    _os.environ["ARGOS_DEVICE_TYPE"] = "cuda" if device == "cuda" else "cpu"
                     for s, t in zip(segs, translated):
                         s["text"] = t
-                        # Clear word-level data so _to_srt uses translated text
-                        # (word entries still contain original English)
                         s.pop("words", None)
+                    del texts, translated
                     q(f"  translated {detected}→{tgt_lang}", "dim")
 
-                # Plex naming: ShowName.S01E01.LANG.srt next to video file
-                out_lang = tgt_lang if tgt_lang else detected
-                out_path = video.with_suffix(f".{out_lang}.srt")
-                out_path.write_text(_to_srt(segs), encoding="utf-8-sig")
-                q(f"  ✓  saved: {out_path.name}", "ok")
+                # ── Save ──────────────────────────────────────────────────────
+                out_lang    = tgt_lang if tgt_lang else detected
+                out_path    = Path(str(video.with_suffix("")) + f".{out_lang}.srt")
+                srt_content = _to_srt(segs, sub_offset)
+                del segs
+                saved = False
+                for attempt in range(3):
+                    try:
+                        out_path.write_text(srt_content, encoding="utf-8-sig")
+                        saved = True
+                        break
+                    except PermissionError:
+                        if attempt < 2:
+                            q(f"  ⚠  file locked, retrying in 3s…", "warn")
+                            _time.sleep(3)
+                        else:
+                            raise PermissionError(
+                                f"Could not write {out_path.name} — file is locked. "
+                                f"Close any media player or pause Plex scanning.")
+                if saved:
+                    q(f"  ✓  saved: {out_path.name}", "ok")
 
-                # Update library DB immediately so status reflects without a rescan
+                # Update library DB
                 fp = file_fingerprint(video)
                 self.library_db.update(video, "DONE", True, str(out_path), fp)
                 self._update_lib_entry(video, "DONE")
 
-                # Mark job done in UI
+                # Mark job done
                 job["status"] = "done"
                 self.after(0, lambda i=iid: self._set_job_status(i, "done"))
+
+                # ── Post-file GPU cleanup ─────────────────────────────────────
+                _t.cuda.empty_cache()
+                gc.collect()
 
             except Exception as e:
                 q(f"  ✗  error: {e}", "err")
                 job["status"] = "error"
                 self.after(0, lambda i=iid: self._set_job_status(i, "error"))
                 try:
-                    import torch as _t, gc
-                    _t.cuda.empty_cache()
-                    gc.collect()
-                    if "CUDA error" in str(e):
-                        q(f"  ↺  CUDA error detected — reloading model…", "warn")
+                    import torch as _t, gc, time as _time
+                    # Always clean up local variables that may hold GPU memory
+                    for var in ("audio", "result", "segs", "aligned",
+                                "align_model", "align_meta", "texts", "translated"):
+                        try:
+                            exec(f"del {var}")
+                        except Exception:
+                            pass
+                    is_cuda_err = any(x in str(e) for x in (
+                        "CUDA error", "CUDA out of memory", "illegal memory",
+                        "device-side assert", "cusolver"))
+                    if is_cuda_err:
+                        q(f"  ↺  CUDA error — resetting GPU state…", "warn")
+                        try:
+                            _t.cuda.synchronize()
+                        except Exception:
+                            pass
+                        _t.cuda.empty_cache()
+                        gc.collect()
+                        _time.sleep(3)
+                        _t.cuda.empty_cache()
+                        gc.collect()
+                        try:
+                            del whisper_model
+                        except Exception:
+                            pass
+                        _time.sleep(2)
                         try:
                             whisper_model = whisperx.load_model(
                                 model_name, device, compute_type=compute_raw,
                                 language=src_lang
                             )
-                            q(f"  ✓  Model reloaded.", "ok")
+                            q(f"  ✓  Model reloaded — continuing.", "ok")
                         except Exception as reload_err:
                             q(f"  ✗  Could not reload model: {reload_err}", "err")
                     else:
+                        _t.cuda.empty_cache()
+                        gc.collect()
                         q(f"  ↺  GPU memory cleared, continuing…", "warn")
                 except Exception:
                     pass
@@ -1116,10 +1299,14 @@ class SubtitleApp(tk.Tk):
         self._finish()
 
     def _finish(self):
-        self.is_running = False
+        self.is_running     = False
+        self.stop_requested = False
         self.library_db.save()
         self.after(0, lambda: self.run_btn.configure_text("▶  Start Processing"))
-        self.after(0, lambda: self.status_label.configure(text="Finished. Click Scan to refresh library."))
+        self.after(0, lambda: self.stop_btn.configure(
+            text="⏹  Stop After Current", state="disabled", fg=TEXT_MUTED))
+        self.after(0, lambda: self.status_label.configure(
+            text="Finished. Click Scan to refresh library."))
 
     def _update_lib_entry(self, video: Path, status: str):
         """Update the in-memory lib_entries for a single file after processing."""
@@ -1146,6 +1333,8 @@ class SubtitleApp(tk.Tk):
                 agg = "CHANGED"
             elif "NEW" in status_set or "UNPROCESSED" in status_set:
                 agg = "PARTIAL"
+            elif "EMBEDDED" in status_set and not any(s in ("NEW","UNPROCESSED") for s in all_statuses):
+                agg = "EMBEDDED"
             elif "EXTERNAL" in status_set:
                 agg = "EXTERNAL"
             else:
@@ -1165,7 +1354,25 @@ class SubtitleApp(tk.Tk):
 
 
 # ─── SRT helper ───────────────────────────────────────────────────────────────
-def _to_srt(segments):
+def _to_srt(segments, onset=0.25):
+    """
+    Convert WhisperX segments to SRT format.
+
+    Strategy:
+    - Use word timestamps only to find the true start/end of each segment
+    - Keep each WhisperX segment as a single subtitle unless it's very long
+    - Only split long segments, using sentence boundaries not word boundaries
+    - Enforce minimum display time via reading speed estimate
+    """
+    import re
+
+    GAP       = 0.05   # minimum gap between subtitles (seconds)
+    MAX_CHARS = 120    # characters before splitting a merged segment
+    ONSET     = max(0.0, float(onset))
+    # Reading speed: ~15 chars/second for translated subtitles
+    CHARS_PER_SEC = 15.0
+    MIN_DURATION  = 2.0  # absolute floor regardless of text length
+
     def ts(t):
         t = max(0.0, float(t))
         h  = int(t // 3600)
@@ -1174,113 +1381,190 @@ def _to_srt(segments):
         ms = int(round((t - int(t)) * 1000))
         return f"{h:02}:{m:02}:{s:02},{ms:03}"
 
-    def split_segment(seg, max_chars=80):
-        """Split a long segment using word timings if available, else proportional."""
-        text = seg.get("text", "").strip()
-        start = float(seg.get("start", 0))
-        end   = float(seg.get("end", 0))
-        duration = end - start
+    def reading_time(text):
+        """Minimum display duration based on text length."""
+        return max(MIN_DURATION, len(text) / CHARS_PER_SEC)
+
+    def get_word_anchors(seg):
+        """
+        Extract actual speech start and end from word timestamps.
+        Falls back to segment timestamps + ONSET if words unavailable.
+        """
         words = seg.get("words", [])
+        valid = [w for w in words
+                 if w.get("word", "").strip()
+                 and w.get("start") is not None
+                 and w.get("end") is not None]
+        seg_start = float(seg.get("start", 0))
+        seg_end   = float(seg.get("end", seg_start + 2))
+        if valid:
+            # Word timestamps are generally accurate for end but early for start
+            return valid[0]["start"] + ONSET, valid[-1]["end"]
+        else:
+            return seg_start + ONSET, seg_end
 
-        if len(text) <= max_chars and not words:
-            return [{"start": start, "end": end, "text": text}]
-
-        # Use word-level timings if available (from alignment)
-        if words:
-            result = []
-            chunk_words = []
-            chunk_start = None
-
-            for w in words:
-                w_start = w.get("start")
-                w_end   = w.get("end")
-                w_word  = w.get("word", "").strip()
-                if not w_word:
-                    continue
-                if chunk_start is None:
-                    chunk_start = w_start if w_start is not None else start
-
-                chunk_words.append(w)
-                chunk_text = " ".join(x.get("word","").strip() for x in chunk_words)
-
-                if len(chunk_text) >= max_chars and len(chunk_words) > 1:
-                    # Save chunk up to previous word
-                    prev = chunk_words[:-1]
-                    prev_text = " ".join(x.get("word","").strip() for x in prev)
-                    prev_end  = prev[-1].get("end") or end
-                    result.append({"start": chunk_start, "end": prev_end, "text": prev_text})
-                    chunk_words = [w]
-                    chunk_start = w_start if w_start is not None else prev_end
-
-            if chunk_words:
-                chunk_text = " ".join(x.get("word","").strip() for x in chunk_words)
-                chunk_end  = chunk_words[-1].get("end") or end
-                result.append({"start": chunk_start, "end": chunk_end, "text": chunk_text})
-
-            return result if result else [{"start": start, "end": end, "text": text}]
-
-        # Split on sentence boundaries first, then on commas if still too long
-        import re
-        # Split on .!? followed by space, or on comma+space
-        parts = re.split(r'(?<=[.!?])\s+', text)
+    def split_long_text(text, start, end):
+        """Split a long segment into 2 parts at a natural boundary."""
+        duration = end - start
+        # Try sentence boundary first
+        parts = re.split(r'(?<=[.!?])\s+', text, maxsplit=1)
         if len(parts) == 1:
-            parts = re.split(r'(?<=,)\s+', text)
+            parts = re.split(r'(?<=,)\s+', text, maxsplit=1)
         if len(parts) == 1:
-            # Last resort: split roughly in half at a space
+            # Split near middle at word boundary
             mid = len(text) // 2
             split_at = text.rfind(' ', 0, mid + 20)
             if split_at == -1:
-                split_at = mid
+                split_at = text.find(' ', mid)
+            if split_at == -1:
+                return [{"start": start, "end": end, "text": text}]
             parts = [text[:split_at].strip(), text[split_at:].strip()]
 
-        # Merge very short parts with the next one
-        merged = []
-        buf = ""
-        for p in parts:
-            if not p.strip():
-                continue
-            if buf and len(buf) + len(p) + 1 <= max_chars:
-                buf = buf + " " + p
-            else:
-                if buf:
-                    merged.append(buf)
-                buf = p
-        if buf:
-            merged.append(buf)
-
-        if not merged:
+        if len(parts) != 2 or not parts[0] or not parts[1]:
             return [{"start": start, "end": end, "text": text}]
 
-        # Assign timing proportionally by character count
-        total_chars = sum(len(p) for p in merged)
-        result = []
-        t = start
-        for p in merged:
-            ratio = len(p) / total_chars if total_chars > 0 else 1 / len(merged)
-            seg_duration = duration * ratio
-            result.append({
-                "start": round(t, 3),
-                "end":   round(min(t + seg_duration, end), 3),
-                "text":  p.strip()
-            })
-            t += seg_duration
+        # Split duration proportionally by character count
+        r = len(parts[0]) / max(len(text), 1)
+        mid_time = start + duration * r
+        return [
+            {"start": start,    "end": mid_time, "text": parts[0]},
+            {"start": mid_time, "end": end,       "text": parts[1]},
+        ]
 
-        return result
+    # ── Merge consecutive short/dense segments ───────────────────────────────
+    # WhisperX produces many short breath-group segments tightly packed together.
+    # Merge them into larger units that read more naturally.
+    MERGE_GAP     = 0.4   # merge if gap between segments is under this
+    MERGE_CHARS   = 120   # don't merge if combined text would exceed this
+    MIN_SEG_CHARS = 40    # merge segments shorter than this with the next
 
-    lines = []
-    counter = 1
+    merged = []
+    buf_text  = ""
+    buf_start = None
+    buf_end   = None
+    buf_words = []
+
     for seg in segments:
-        for chunk in split_segment(seg):
-            text = chunk.get("text", "").strip()
-            if not text:
-                continue
-            lines.append(str(counter))
-            lines.append(f"{ts(chunk['start'])} --> {ts(chunk['end'])}")
-            lines.append(text)
-            lines.append("")
-            counter += 1
-    content = "\n".join(lines)
-    return OUR_TAG + "\n" + content
+        text = seg.get("text", "").strip()
+        if not text:
+            continue
+
+        seg_start = float(seg.get("start", 0))
+        seg_end   = float(seg.get("end", seg_start + 1))
+        words     = seg.get("words", [])
+
+        if buf_start is None:
+            buf_text  = text
+            buf_start = seg_start
+            buf_end   = seg_end
+            buf_words = list(words)
+            continue
+
+        gap          = seg_start - buf_end
+        combined_len = len(buf_text) + 1 + len(text)
+        ends_sentence = buf_text and buf_text[-1] in '.!?'
+
+        # Merge if: gap is small AND combined isn't too long AND doesn't end a sentence
+        should_merge = (
+            gap <= MERGE_GAP and
+            combined_len <= MERGE_CHARS and
+            not ends_sentence
+        )
+        # Also merge if current buffer is very short regardless of gap
+        if len(buf_text) < MIN_SEG_CHARS and gap <= 1.5 and combined_len <= MERGE_CHARS:
+            should_merge = True
+
+        if should_merge:
+            buf_text  = buf_text + " " + text
+            buf_end   = seg_end
+            buf_words.extend(words)
+        else:
+            merged.append({"text": buf_text, "start": buf_start,
+                           "end": buf_end, "words": buf_words})
+            buf_text  = text
+            buf_start = seg_start
+            buf_end   = seg_end
+            buf_words = list(words)
+
+    if buf_text:
+        merged.append({"text": buf_text, "start": buf_start,
+                       "end": buf_end, "words": buf_words})
+
+    segments = merged
+
+    # ── Build raw subtitle list ───────────────────────────────────────────────
+    raw = []
+    for seg in segments:
+        text = seg.get("text", "").strip()
+        if not text:
+            continue
+
+        w_start, w_end = get_word_anchors(seg)
+
+        if len(text) <= MAX_CHARS:
+            raw.append({"start": w_start, "end": w_end, "text": text})
+        else:
+            raw.extend(split_long_text(text, w_start, w_end))
+
+    # Sort by start time
+    raw.sort(key=lambda x: x["start"])
+
+    # How much silence to borrow — only extend into gaps up to this size
+    # Larger gaps are scene breaks / different speakers — don't fill them
+    MAX_BORROW = 1.2  # seconds
+
+    # ── Final pass: enforce reading time and use silence for display ─────────
+    lines    = []
+    counter  = 1
+    prev_end = 0.0
+
+    for i, chunk in enumerate(raw):
+        text  = chunk.get("text", "").strip()
+        if not text:
+            continue
+
+        start = float(chunk["start"])
+        end   = float(chunk["end"])
+
+        # Don't start before previous subtitle ended
+        start = max(start, prev_end + GAP)
+
+        # How long the reader needs to comfortably read this text
+        needed = reading_time(text)
+
+        # When does the next subtitle start?
+        next_start = None
+        for j in range(i + 1, len(raw)):
+            if raw[j].get("text", "").strip():
+                next_start = float(raw[j]["start"])
+                break
+
+        if next_start is not None:
+            gap_to_next = next_start - (start + needed)
+            if gap_to_next <= 0:
+                # No room — squeeze in as much as possible without overlapping
+                end = max(start + MIN_DURATION, next_start - GAP)
+            elif gap_to_next <= MAX_BORROW:
+                # Small gap — borrow it, extend to reading time
+                end = start + needed
+            else:
+                # Large gap = scene break or different speaker
+                # Just use reading time, leave the silence alone
+                end = start + needed
+        else:
+            # Last subtitle
+            end = start + max(needed, end - start)
+
+        end = max(end, start + MIN_DURATION)
+
+        lines.append(str(counter))
+        lines.append(f"{ts(start)} --> {ts(end)}")
+        lines.append(text)
+        lines.append("")
+        counter  += 1
+        prev_end  = end
+
+    return "\n".join(lines) + f"\n\n{OUR_TAG}\n"
 
 
 
@@ -1340,7 +1624,7 @@ class LibraryWindow(tk.Toplevel):
         styled_entry(r2, self.scan_lang_var, width=4).pack(side="left", padx=(4, 16))
         tk.Label(r2, text="Filter:", font=("Consolas", 9), fg=TEXT_DIM,
                  bg=BG_PANEL).pack(side="left")
-        for f in ["ALL", "NEW", "UNPROCESSED", "DONE", "PARTIAL", "CHANGED", "EXTERNAL"]:
+        for f in ["ALL", "NEW", "UNPROCESSED", "DONE", "PARTIAL", "CHANGED", "EXTERNAL", "EMBEDDED"]:
             tk.Radiobutton(r2, text=f, variable=self.filter_var, value=f,
                            command=self._populate,
                            bg=BG_PANEL, fg=TEXT, selectcolor=BG_INPUT,
@@ -1390,7 +1674,8 @@ class LibraryWindow(tk.Toplevel):
         # Tags
         for tag, color in [("NEW","#5b9bd5"),("UNPROCESSED","#8888cc"),
                             ("DONE",SUCCESS_COL),("PARTIAL","#c08030"),
-                            ("CHANGED",WARN),("EXTERNAL",TEXT_DIM)]:
+                            ("CHANGED",WARN),("EXTERNAL",TEXT_DIM),
+                            ("EMBEDDED","#a070d0")]:
             self.tree.tag_configure(tag, foreground=color)
         self.tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
@@ -1398,17 +1683,18 @@ class LibraryWindow(tk.Toplevel):
         # ── Bottom bar ────────────────────────────────────────────────────────
         bot = tk.Frame(self, bg=BG_PANEL, padx=16, pady=10)
         bot.pack(fill="x", side="bottom")
-        FlatButton(bot, "Select All",         command=self._sel_all).pack(side="left", padx=(0,6))
+        FlatButton(bot, "Select ALL",         command=self._sel_all).pack(side="left", padx=(0,6))
         FlatButton(bot, "Select NEW",         command=lambda: self._sel_status("NEW")).pack(side="left", padx=(0,6))
         FlatButton(bot, "Select UNPROCESSED", command=lambda: self._sel_status("UNPROCESSED")).pack(side="left", padx=(0,6))
         FlatButton(bot, "Select CHANGED",     command=lambda: self._sel_status("CHANGED")).pack(side="left", padx=(0,6))
+        FlatButton(bot, "Select EMBEDDED",    command=lambda: self._sel_status("EMBEDDED")).pack(side="left", padx=(0,6))
         FlatButton(bot, "Expand All",         command=self._expand_all).pack(side="left", padx=(0,6))
         FlatButton(bot, "Collapse All",       command=self._collapse_all).pack(side="left", padx=(0,6))
         self.count_label = tk.Label(bot, text="", font=("Consolas", 9),
                                     fg=TEXT_MUTED, bg=BG_PANEL)
         self.count_label.pack(side="left", padx=(12, 0))
         FlatButton(bot, "Close", command=self.destroy).pack(side="right", padx=(8, 0))
-        FlatButton(bot, "▶  Process Selected", command=self._process,
+        FlatButton(bot, "＋  Add to Queue", command=self._process,
                    accent=True).pack(side="right")
         self.scan_status = tk.Label(bot, text="", font=("Consolas", 9),
                                     fg=WARN, bg=BG_PANEL)
@@ -1506,6 +1792,8 @@ class LibraryWindow(tk.Toplevel):
                     agg = "CHANGED"
                 elif "NEW" in status_set or "UNPROCESSED" in status_set:
                     agg = "PARTIAL"
+                elif "EMBEDDED" in status_set and not any(s in ("NEW","UNPROCESSED") for s in ep_statuses):
+                    agg = "EMBEDDED"
                 elif "EXTERNAL" in status_set:
                     agg = "EXTERNAL"
                 else:
@@ -1559,7 +1847,8 @@ class LibraryWindow(tk.Toplevel):
                      "DONE":         "✓ DONE",
                      "PARTIAL":      "◑ PARTIAL",
                      "CHANGED":      "▲ CHANGED",
-                     "EXTERNAL":     "~ EXTERNAL"}.get(e["status"], e["status"])
+                     "EXTERNAL":     "~ EXTERNAL",
+                     "EMBEDDED":     "⊕ EMBEDDED"}.get(e["status"], e["status"])
 
             parent = self.tree.insert("", "end", text=rel,
                                        values=(badge, e["total"], e["done"], e["path"]),
@@ -1574,7 +1863,8 @@ class LibraryWindow(tk.Toplevel):
                             "UNPROCESSED":"○ UNPROCESSED",
                             "DONE":       "✓ DONE",
                             "CHANGED":    "▲ CHANGED",
-                            "EXTERNAL":   "~ EXTERNAL"}.get(ep["status"], ep["status"])
+                            "EXTERNAL":   "~ EXTERNAL",
+                            "EMBEDDED":   "⊕ EMBEDDED"}.get(ep["status"], ep["status"])
                 srt_name = Path(ep["srt"]).name if ep.get("srt") else ""
                 detail = f"  {ep_name}"
                 if srt_name:
@@ -1612,21 +1902,19 @@ class LibraryWindow(tk.Toplevel):
             self.scan_status.configure(text="Select folders or episodes first.")
             return
         lang = self.scan_lang_var.get().strip() or "no"
-        skip_done = self.app.skip_no_var.get()
         video_files = []
 
         for iid in sel:
             parent = self.tree.parent(iid)
             if parent:
-                # It's an episode — add directly
+                # Episode row — add directly
                 path_val = self.tree.item(iid)["values"][3]
-                # Strip srt_info suffix if present
                 path_str = path_val.split("  ")[0].strip()
                 p = Path(path_str)
                 if p.exists() and p.suffix.lower() in VIDEO_EXTENSIONS:
                     video_files.append(p)
             else:
-                # It's a folder — walk it
+                # Folder row — walk and add all videos (skip DONE ones)
                 folder = Path(self.tree.item(iid)["values"][3])
                 for root, dirs, files in os.walk(folder):
                     dirs.sort(key=lambda d: (
@@ -1635,15 +1923,14 @@ class LibraryWindow(tk.Toplevel):
                         p = Path(root) / f
                         if p.suffix.lower() not in VIDEO_EXTENSIONS:
                             continue
-                        if skip_done:
-                            cached = self.app.library_db.get(p)
-                            status, _, _, _ = scan_video_status(p, lang, cached)
-                            if status == "DONE":
-                                continue
+                        cached = self.app.library_db.get(p)
+                        status, _, _, _ = scan_video_status(p, lang, cached)
+                        if status == "DONE":
+                            continue
                         video_files.append(p)
 
         # Deduplicate preserving order
-        seen = set()
+        seen  = set()
         unique = []
         for v in video_files:
             if str(v) not in seen:
@@ -1651,10 +1938,9 @@ class LibraryWindow(tk.Toplevel):
                 unique.append(v)
 
         if not unique:
-            self.scan_status.configure(text="No files to process (all DONE?).")
+            self.scan_status.configure(text="Nothing to add — all selected files are DONE.")
             return
 
-        self.scan_status.configure(text=f"Sending {len(unique)} file(s) to processor…")
         self.app._queue_from_library(unique)
         self.destroy()
 
