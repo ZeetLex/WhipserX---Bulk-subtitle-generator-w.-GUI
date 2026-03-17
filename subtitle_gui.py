@@ -1048,6 +1048,19 @@ class SubtitleApp(tk.Tk):
         q(f"  Files    : {total}", "info")
         if dry_run:
             q("  Mode     : DRY RUN", "warn")
+
+        # Warn if Chrome is running — it uses GPU hardware acceleration which
+        # can cause CUDA illegal memory access errors during processing
+        try:
+            import subprocess
+            result = subprocess.run(["tasklist", "/FI", "IMAGENAME eq chrome.exe"],
+                                    capture_output=True, text=True, timeout=3)
+            if "chrome.exe" in result.stdout.lower():
+                q("  ⚠  Chrome is running. GPU acceleration in Chrome can cause CUDA", "warn")
+                q("      crashes. Consider closing Chrome or disabling its hardware", "warn")
+                q("      acceleration (Settings → System → Hardware Acceleration).", "warn")
+        except Exception:
+            pass
         q("", "dim")
 
         if dry_run:
@@ -1245,11 +1258,8 @@ class SubtitleApp(tk.Tk):
 
             except Exception as e:
                 q(f"  ✗  error: {e}", "err")
-                job["status"] = "error"
-                self.after(0, lambda i=iid: self._set_job_status(i, "error"))
                 try:
                     import torch as _t, gc, time as _time
-                    # Always clean up local variables that may hold GPU memory
                     for var in ("audio", "result", "segs", "aligned",
                                 "align_model", "align_meta", "texts", "translated"):
                         try:
@@ -1261,34 +1271,50 @@ class SubtitleApp(tk.Tk):
                         "device-side assert", "cusolver"))
                     if is_cuda_err:
                         q(f"  ↺  CUDA error — resetting GPU state…", "warn")
+                        q(f"  ℹ  Tip: close Chrome and other GPU apps during processing", "dim")
                         try:
                             _t.cuda.synchronize()
                         except Exception:
                             pass
                         _t.cuda.empty_cache()
                         gc.collect()
-                        _time.sleep(3)
+                        _time.sleep(5)  # longer wait to let other GPU users settle
                         _t.cuda.empty_cache()
                         gc.collect()
                         try:
                             del whisper_model
                         except Exception:
                             pass
-                        _time.sleep(2)
+                        _time.sleep(3)
                         try:
                             whisper_model = whisperx.load_model(
                                 model_name, device, compute_type=compute_raw,
                                 language=src_lang
                             )
-                            q(f"  ✓  Model reloaded — continuing.", "ok")
+                            # Re-enable TF32 after reload
+                            _t.backends.cuda.matmul.allow_tf32 = True
+                            _t.backends.cudnn.allow_tf32 = True
+                            _t.backends.cudnn.benchmark  = False
+                            q(f"  ✓  Model reloaded — retrying file…", "ok")
+                            # Re-queue this job so it gets retried next iteration
+                            job["status"] = "pending"
+                            self.after(0, lambda i=iid: self._set_job_status(i, "pending"))
+                            # Insert at next position in pending list
+                            pending.insert(idx + 1, job)
+                            total += 1
                         except Exception as reload_err:
                             q(f"  ✗  Could not reload model: {reload_err}", "err")
+                            job["status"] = "error"
+                            self.after(0, lambda i=iid: self._set_job_status(i, "error"))
                     else:
                         _t.cuda.empty_cache()
                         gc.collect()
                         q(f"  ↺  GPU memory cleared, continuing…", "warn")
+                        job["status"] = "error"
+                        self.after(0, lambda i=iid: self._set_job_status(i, "error"))
                 except Exception:
-                    pass
+                    job["status"] = "error"
+                    self.after(0, lambda i=iid: self._set_job_status(i, "error"))
 
             done += 1
             pct = (done / total) * 100
