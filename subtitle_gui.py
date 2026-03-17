@@ -105,6 +105,7 @@ class SubtitleApp(tk.Tk):
 
         # Variables
         self.folder_var      = tk.StringVar(value="")
+        self.queue_folders   = []          # ordered list of folder paths in queue
         self.model_var       = tk.StringVar(value="medium")
         self.compute_var     = tk.StringVar(value="float16")
         self.lang_var        = tk.StringVar(value="auto-detect")
@@ -140,27 +141,52 @@ class SubtitleApp(tk.Tk):
         outer = tk.Frame(self, bg=BG)
         outer.pack(fill="both", expand=True, padx=24, pady=(0, 8))
 
-        # ── Folder card ───────────────────────────────────────────────────────
-        folder_card = tk.Frame(outer, bg=BG_PANEL, padx=16, pady=14)
-        folder_card.pack(fill="x", pady=(0, 8))
+        # ── Queue card ────────────────────────────────────────────────────────
+        queue_card = tk.Frame(outer, bg=BG_PANEL, padx=16, pady=14)
+        queue_card.pack(fill="x", pady=(0, 8))
 
-        section_label(folder_card, "Target Folder").pack(fill="x", pady=(0, 8))
+        section_label(queue_card, "Processing Queue").pack(fill="x", pady=(0, 8))
 
-        path_row = tk.Frame(folder_card, bg=BG_PANEL)
-        path_row.pack(fill="x")
-        styled_entry(path_row, self.folder_var, width=50).pack(side="left", fill="x",
-                                                               expand=True, padx=(0, 8))
-        FlatButton(path_row, "Browse", command=self._browse).pack(side="left")
-        FlatButton(path_row, "Scan", command=self._scan_folder).pack(side="left", padx=(6, 0))
+        # Add folder row
+        add_row = tk.Frame(queue_card, bg=BG_PANEL)
+        add_row.pack(fill="x", pady=(0, 8))
+        self.add_entry = styled_entry(add_row, self.folder_var, width=50)
+        self.add_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        FlatButton(add_row, "Browse", command=self._browse).pack(side="left")
+        FlatButton(add_row, "Add to Queue", command=self._add_to_queue).pack(side="left", padx=(6, 0))
 
-        # File list
-        self.file_frame = tk.Frame(folder_card, bg=BG_INPUT, pady=6, padx=10)
-        self.file_frame.pack(fill="x", pady=(10, 0))
-        self.file_label = tk.Label(self.file_frame,
-                                   text="Select a folder and click Scan…",
+        # Queue listbox with scrollbar
+        list_frame = tk.Frame(queue_card, bg=BG_PANEL)
+        list_frame.pack(fill="x", pady=(0, 6))
+
+        scrollbar = tk.Scrollbar(list_frame, orient="vertical", bg=BG_INPUT,
+                                  troughcolor=BG_INPUT, width=10)
+        self.queue_listbox = tk.Listbox(
+            list_frame, height=6,
+            bg=BG_INPUT, fg=TEXT, selectbackground=ACCENT, selectforeground="#000",
+            font=("Consolas", 9), relief="flat", borderwidth=0,
+            highlightthickness=1, highlightbackground=BORDER,
+            activestyle="none", yscrollcommand=scrollbar.set
+        )
+        scrollbar.config(command=self.queue_listbox.yview)
+        self.queue_listbox.pack(side="left", fill="x", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        # Queue controls
+        ctrl_row = tk.Frame(queue_card, bg=BG_PANEL)
+        ctrl_row.pack(fill="x")
+        FlatButton(ctrl_row, "▲ Move Up",    command=self._queue_up).pack(side="left", padx=(0, 6))
+        FlatButton(ctrl_row, "▼ Move Down",  command=self._queue_down).pack(side="left", padx=(0, 6))
+        FlatButton(ctrl_row, "✕ Remove",     command=self._queue_remove).pack(side="left", padx=(0, 6))
+        FlatButton(ctrl_row, "Clear All",    command=self._queue_clear).pack(side="left", padx=(0, 6))
+        FlatButton(ctrl_row, "Scan Queue",   command=self._scan_queue).pack(side="right")
+
+        # File count label
+        self.file_label = tk.Label(queue_card,
+                                   text="Add folders to the queue and click Scan Queue…",
                                    font=("Consolas", 9), fg=TEXT_MUTED,
-                                   bg=BG_INPUT, anchor="w")
-        self.file_label.pack(fill="x")
+                                   bg=BG_PANEL, anchor="w")
+        self.file_label.pack(fill="x", pady=(8, 0))
 
         # ── Settings card ─────────────────────────────────────────────────────
         settings_card = tk.Frame(outer, bg=BG_PANEL, padx=16, pady=14)
@@ -291,43 +317,113 @@ class SubtitleApp(tk.Tk):
             self.gpu_badge.configure(text="  torch not installed  ",
                                      fg=TEXT_DIM, bg=BG_INPUT)
 
-    # ── Folder browse + scan ──────────────────────────────────────────────────
+    # ── Queue management ──────────────────────────────────────────────────────
     def _browse(self):
-        folder = filedialog.askdirectory(title="Select TV Shows folder")
+        folder = filedialog.askdirectory(title="Select folder to add to queue")
         if folder:
             self.folder_var.set(folder)
-            self._scan_folder()
 
-    def _scan_folder(self):
+    def _add_to_queue(self):
         folder = self.folder_var.get().strip()
-        if not folder or not os.path.isdir(folder):
+        if not folder:
+            return
+        if not os.path.isdir(folder):
             self.file_label.configure(text="⚠  Folder not found.", fg=WARN)
             return
+        if folder in self.queue_folders:
+            self.file_label.configure(text="⚠  Folder already in queue.", fg=WARN)
+            return
+        self.queue_folders.append(folder)
+        self.queue_listbox.insert("end", folder)
+        self.folder_var.set("")
+        self.file_label.configure(
+            text=f"✓  {len(self.queue_folders)} folder(s) in queue. Click Scan Queue to count files.",
+            fg=ACCENT)
+
+    def _queue_up(self):
+        sel = self.queue_listbox.curselection()
+        if not sel or sel[0] == 0:
+            return
+        i = sel[0]
+        self.queue_folders[i], self.queue_folders[i-1] = self.queue_folders[i-1], self.queue_folders[i]
+        self._refresh_queue_listbox(i-1)
+
+    def _queue_down(self):
+        sel = self.queue_listbox.curselection()
+        if not sel or sel[0] >= len(self.queue_folders) - 1:
+            return
+        i = sel[0]
+        self.queue_folders[i], self.queue_folders[i+1] = self.queue_folders[i+1], self.queue_folders[i]
+        self._refresh_queue_listbox(i+1)
+
+    def _queue_remove(self):
+        sel = self.queue_listbox.curselection()
+        if not sel:
+            return
+        i = sel[0]
+        self.queue_folders.pop(i)
+        self._refresh_queue_listbox(min(i, len(self.queue_folders)-1))
+        self.file_label.configure(
+            text=f"{len(self.queue_folders)} folder(s) in queue.", fg=TEXT_DIM)
+
+    def _queue_clear(self):
+        self.queue_folders.clear()
+        self.queue_listbox.delete(0, "end")
         self.video_files = []
+        self.file_label.configure(text="Queue cleared.", fg=TEXT_MUTED)
+
+    def _refresh_queue_listbox(self, select_idx=None):
+        self.queue_listbox.delete(0, "end")
+        for f in self.queue_folders:
+            self.queue_listbox.insert("end", f)
+        if select_idx is not None and 0 <= select_idx < len(self.queue_folders):
+            self.queue_listbox.selection_set(select_idx)
+            self.queue_listbox.see(select_idx)
+
+    def _scan_queue(self):
+        if not self.queue_folders:
+            self.file_label.configure(text="⚠  No folders in queue.", fg=WARN)
+            return
         skip_en = self.skip_var.get()
         skip_no = self.skip_no_var.get()
-        for root, _, files in os.walk(folder):
-            for f in files:
-                p = Path(root) / f
-                if p.suffix.lower() in VIDEO_EXTENSIONS:
-                    if skip_en and p.with_suffix('.en.srt').exists():
-                        continue
-                    if skip_no and p.with_suffix('.no.srt').exists():
-                        continue
-                    self.video_files.append(p)
-        self.video_files.sort()
+        tgt_raw = self.target_var.get()
+        tgt_lang = None if "None" in tgt_raw else tgt_raw.split("(")[-1].rstrip(")")
+
+        self.video_files = []
+        for folder in self.queue_folders:
+            folder_files = []
+            for root, dirs, files in os.walk(folder):
+                # Sort dirs so Season 1 comes before Season 2 etc.
+                dirs.sort(key=lambda d: (
+                    # extract leading number for natural sort
+                    int(''.join(filter(str.isdigit, d)) or 0),
+                    d.lower()
+                ))
+                for f in sorted(files):
+                    p = Path(root) / f
+                    if p.suffix.lower() in VIDEO_EXTENSIONS:
+                        skip_suf = f".{tgt_lang}.srt" if tgt_lang else ".en.srt"
+                        if skip_en and p.with_suffix('.en.srt').exists():
+                            continue
+                        if skip_no and p.with_suffix('.no.srt').exists():
+                            continue
+                        folder_files.append(p)
+            self.video_files.extend(folder_files)
+
         count = len(self.video_files)
         if count == 0:
             self.file_label.configure(
                 text="No video files found (or all already have subtitles).",
                 fg=TEXT_MUTED)
         else:
-            preview = "  |  ".join(str(p.relative_to(folder)) for p in self.video_files[:4])
-            if count > 4:
-                preview += f"  … +{count-4} more"
             self.file_label.configure(
-                text=f"✓  {count} file(s) found:  {preview}", fg=ACCENT)
-        self.status_label.configure(text=f"{count} file(s) queued.")
+                text=f"✓  {count} file(s) queued across {len(self.queue_folders)} folder(s)",
+                fg=ACCENT)
+        self.status_label.configure(text=f"{count} file(s) ready.")
+
+    # keep _scan_folder as alias used by _start
+    def _scan_folder(self):
+        self._scan_queue()
 
     # ── Log helpers ───────────────────────────────────────────────────────────
     def _log(self, msg, tag=""):
@@ -355,10 +451,10 @@ class SubtitleApp(tk.Tk):
     def _start(self):
         if self.is_running:
             return
-        if not self.folder_var.get().strip():
-            self._log("⚠  Please select a folder first.", "warn")
+        if not self.queue_folders:
+            self._log("⚠  Please add at least one folder to the queue first.", "warn")
             return
-        self._scan_folder()
+        self._scan_queue()
         if not self.video_files:
             self._log("⚠  No files to process.", "warn")
             return
